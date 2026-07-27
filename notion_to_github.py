@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 NOTION_VERSION = "2022-06-28"
@@ -34,8 +35,10 @@ API = "https://api.notion.com/v1"
 # --------------------------------------------------------------------------- #
 def notion(path, token, method="GET", body=None):
     data = json.dumps(body).encode() if body is not None else None
+    # Callers may pass either an absolute URL or a path relative to API.
+    _final_url = path if path.startswith("http") else f"{API}{path}"
     req = urllib.request.Request(
-        f"{API}{path}",
+        _final_url,
         data=data,
         method=method,
         headers={
@@ -102,6 +105,207 @@ def prop_value(p):
     if t == "date":
         return (v or {}).get("start", "") if v else ""
     return ""
+
+
+def db_id_from_arg(value):
+    """Accept a raw database ID or a Notion URL and return the database ID.
+
+    A Notion database URL looks like:
+        https://www.notion.so/<workspace>/<DATABASE_ID>?v=<VIEW_ID>
+    The path segment is the database ID; the `v=` query param is the view ID
+    (a common source of `object_not_found`), so it must be ignored.
+    """
+    value = value.strip()
+    if "notion.so" in value or value.startswith("http"):
+        path = urllib.parse.urlsplit(value).path
+        value = path.rstrip("/").split("/")[-1]
+        # A page/database slug may be "Title-<id>"; keep the trailing id part.
+        if "-" in value:
+            value = value.split("-")[-1]
+    ids = re.findall(r"[0-9a-fA-F]{32}", value.replace("-", ""))
+    return ids[0] if ids else value
+
+
+def repo_from_arg(value):
+    """Accept a repo as `owner/name`, a GitHub URL, or an SSH remote and return
+    the canonical `owner/name`.
+
+    A bare name (e.g. `elector-issues`) is rejected, because `gh` would silently
+    assume the logged-in user as the owner — which fails for repos that live
+    under an organization.
+    """
+    value = value.strip()
+    # SSH form: git@github.com:owner/name(.git).
+    m = re.match(r"git@[^:]+:(?P<path>.+)", value)
+    if m:
+        value = m.group("path")
+    elif value.startswith("http"):
+        value = urllib.parse.urlsplit(value).path.lstrip("/")
+    value = re.sub(r"\.git$", "", value).strip("/")
+    parts = [p for p in value.split("/") if p]
+    if len(parts) < 2:
+        raise SystemExit(
+            f"--repo must be 'owner/name' or a GitHub URL, got '{value}'. "
+            "A bare name is ambiguous (it would default to your personal "
+            "account). Example: --repo CalibrasDK/elector-issues"
+        )
+    return f"{parts[0]}/{parts[1]}"
+
+
+def load_mapping(path):
+    """Load an optional mapping.json that translates Notion property values to
+    GitHub labels, assignees, open/closed state, and issue field values.
+
+    Returns a dict with keys for core sections (``label``, ``assignees``,
+    ``status``) plus an ``issue_fields`` dict that maps GitHub field names to
+    ``{property, map}`` configs.  The legacy ``priority`` top-level section is
+    converted into ``issue_fields["Priority"]`` for backward compatibility.
+    """
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    mapping = {}
+    for section in ("label", "assignees", "status"):
+        if section not in raw:
+            continue
+        s = raw[section]
+        if not isinstance(s, dict) or "property" not in s or "map" not in s:
+            raise SystemExit(
+                f"mapping.json: section '{section}' must contain "
+                "'property' and 'map' keys."
+            )
+        mapping[section] = {"property": s["property"], "map": s["map"]}
+
+    # Collect issue_fields: each key is a GitHub field name, value has
+    # "property" (Notion column) and "map" (value mapping).
+    issue_fields = {}
+    if "issue_fields" in raw:
+        for gh_name, cfg in raw["issue_fields"].items():
+            if not isinstance(cfg, dict) or "property" not in cfg:
+                raise SystemExit(
+                    f"mapping.json: issue_fields['{gh_name}'] must contain "
+                    "at least a 'property' key."
+                )
+            issue_fields[gh_name] = {
+                "property": cfg["property"],
+                "map": cfg.get("map", {}),
+            }
+    # Legacy: promote top-level "priority" into issue_fields.
+    if "priority" in raw and "Priority" not in issue_fields:
+        s = raw["priority"]
+        if isinstance(s, dict) and "property" in s:
+            issue_fields["Priority"] = {
+                "property": s["property"],
+                "map": s.get("map", {}),
+            }
+    if issue_fields:
+        mapping["issue_fields"] = issue_fields
+    return mapping
+
+
+def interpret_status(value):
+    """Interpret a mapped status value as a GitHub issue state.
+
+    Accepts (case-insensitively): ``open``; ``closed`` / ``completed`` (close
+    with reason *completed*); ``not planned`` or ``closed:not planned`` (close
+    with reason *not planned*).
+
+    Returns ``(state, reason)`` where ``state`` is ``"open"``, ``"closed"`` or
+    ``None`` (unrecognised value).
+    """
+    norm = str(value).strip().lower()
+    if norm == "open":
+        return "open", None
+    if norm.startswith("closed:"):
+        return "closed", (norm.split(":", 1)[1].strip() or "completed")
+    if norm in ("closed", "completed", "done"):
+        return "closed", "completed"
+    if norm in ("not planned", "not_planned", "not-planned"):
+        return "closed", "not planned"
+    return None, None
+
+
+def apply_mapping(mapping, props):
+    """Apply a mapping dict to a row's properties.
+
+    Returns ``(labels, assignees, close, close_reason, field_values)`` where
+    ``field_values`` is a dict of ``{GitHub field name: resolved value}`` for
+    each issue_fields entry that matched.
+    """
+    labels, assignees = [], []
+    close, close_reason = False, "completed"
+    field_values = {}
+
+    if "label" in mapping:
+        sec = mapping["label"]
+        raw = prop_value(props.get(sec["property"], {}))
+        for v in (raw if isinstance(raw, list) else [raw]):
+            v = str(v).strip()
+            if not v:
+                continue
+            mapped = sec["map"].get(v)
+            if mapped is None:
+                print(f"  ? label mapping miss: '{v}' (passed through as-is)",
+                      file=sys.stderr)
+                labels.append(v)
+            else:
+                labels.append(mapped)
+
+    if "assignees" in mapping:
+        sec = mapping["assignees"]
+        raw = prop_value(props.get(sec["property"], {}))
+        for v in (raw if isinstance(raw, list) else [raw]):
+            v = str(v).strip()
+            if not v:
+                continue
+            mapped = sec["map"].get(v)
+            if mapped is None:
+                print(f"  ? assignee mapping miss: '{v}' (skipped)",
+                      file=sys.stderr)
+            else:
+                assignees.append(mapped)
+
+    if "status" in mapping:
+        sec = mapping["status"]
+        raw = str(prop_value(props.get(sec["property"], {}))).strip()
+        if raw:
+            mapped = sec["map"].get(raw)
+            if mapped is None:
+                print(f"  ? status mapping miss: '{raw}' (skipped)",
+                      file=sys.stderr)
+            else:
+                state, reason = interpret_status(mapped)
+                if state == "closed":
+                    close, close_reason = True, reason
+                elif state is None:
+                    print(f"  ? unknown status target '{mapped}' for '{raw}' "
+                          "(left open)", file=sys.stderr)
+
+    for gh_name, sec in mapping.get("issue_fields", {}).items():
+        raw = prop_value(props.get(sec["property"], {}))
+        # For multi-select Notion properties, pick the first mapped value
+        # (GitHub single-select fields only hold one).
+        values = raw if isinstance(raw, list) else [raw]
+        for v in values:
+            v = str(v).strip()
+            if not v:
+                continue
+            if sec["map"]:
+                mapped = sec["map"].get(v)
+                if mapped is None:
+                    print(f"  ? {gh_name} mapping miss: '{v}' (skipped)",
+                          file=sys.stderr)
+                    continue
+            else:
+                mapped = v
+            if gh_name in field_values:
+                print(f"  ? {gh_name}: extra value '{v}' ignored "
+                      "(single-select supports one value)", file=sys.stderr)
+            else:
+                field_values[gh_name] = mapped
+
+    return labels, assignees, close, close_reason, field_values
 
 
 # --------------------------------------------------------------------------- #
@@ -187,10 +391,12 @@ def ensure_label(repo, name):
     gh(["label", "create", name, "-R", repo, "-c", "ededed"], check=False)
 
 
-def create_issue(repo, title, body_file, labels):
+def create_issue(repo, title, body_file, labels, assignees=None):
     args = ["issue", "create", "-R", repo, "--title", title, "--body-file", body_file]
     for lb in labels:
         args += ["--label", lb]
+    for user in (assignees or []):
+        args += ["--assignee", user]
     backoff = 5
     for _ in range(6):
         r = gh(args, check=False)
@@ -205,6 +411,52 @@ def create_issue(repo, title, body_file, labels):
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
     return None
+
+
+def discover_issue_field(org, field_name):
+    """Look up an org-level issue field by name and return its ID.
+
+    Uses the ``X-GitHub-Api-Version: 2026-03-10`` preview header required by the
+    issue fields REST API.
+    """
+    r = gh(["api", f"/orgs/{org}/issue-fields",
+            "-H", "X-GitHub-Api-Version: 2026-03-10"], check=False)
+    if r.returncode != 0:
+        print(f"  ! could not list issue fields for org '{org}': "
+              f"{r.stderr.strip()}", file=sys.stderr)
+        return None
+    try:
+        fields = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        print(f"  ! unexpected response from issue-fields API",
+              file=sys.stderr)
+        return None
+    for f in fields:
+        if f.get("name", "").lower() == field_name.lower():
+            return f["id"]
+    names = [f.get("name") for f in fields]
+    print(f"  ! issue field '{field_name}' not found in org '{org}' "
+          f"(available: {names})", file=sys.stderr)
+    return None
+
+
+def set_issue_field_value(repo, issue_number, field_id, value, field_name=""):
+    """Set an org-level issue field value on an existing issue via REST API."""
+    payload = json.dumps({"issue_field_values": [
+        {"field_id": field_id, "value": value}
+    ]})
+    cmd = ["gh", "api", f"/repos/{repo}/issues/{issue_number}/issue-field-values",
+           "-X", "POST",
+           "-H", "X-GitHub-Api-Version: 2026-03-10",
+           "-H", "Content-Type: application/json",
+           "--input", "-"]
+    proc = subprocess.run(cmd, input=payload, capture_output=True, text=True)
+    if proc.returncode != 0:
+        label = field_name or "field"
+        print(f"  ! set {label} failed for #{issue_number}: "
+              f"{proc.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -242,20 +494,45 @@ def main():
     ap = argparse.ArgumentParser(description="Migrate a Notion database into GitHub issues.")
     ap.add_argument("--token", default=os.environ.get("NOTION_TOKEN"),
                     help="Notion integration token (or set NOTION_TOKEN).")
-    ap.add_argument("--database", required=True, help="Notion database ID.")
-    ap.add_argument("--repo", required=True, help="Target GitHub repo as owner/name.")
+    ap.add_argument("--database", required=True, help="Notion database ID or database URL.")
+    ap.add_argument("--repo", required=True, help="Target GitHub repo as owner/name or a GitHub URL.")
     ap.add_argument("--label-prop", action="append", default=[],
                     help="Notion property whose value becomes an issue label. Repeatable.")
     ap.add_argument("--status-prop", help="Property used to detect done items (with --close-status).")
     ap.add_argument("--close-status", help="Close issues whose --status-prop equals this value (e.g. Done).")
     ap.add_argument("--image-branch", default="notion-assets", help="Branch that stores images.")
     ap.add_argument("--assets-dir", default="notion-assets", help="Folder in the repo for images.")
+    ap.add_argument("--mapping", default="mapping.json",
+                    help="Path to mapping.json (default: ./mapping.json).")
+    ap.add_argument("--update-existing", action="store_true",
+                    help="Do not create issues. Instead, match existing issues by "
+                         "title and set issue field values from the mapping.")
     ap.add_argument("--no-images", action="store_true", help="Skip images entirely.")
     ap.add_argument("--dry-run", action="store_true", help="Render everything but create nothing.")
     args = ap.parse_args()
 
     if not args.token:
         raise SystemExit("Missing Notion token: pass --token or set NOTION_TOKEN.")
+
+    args.database = db_id_from_arg(args.database)
+    args.repo = repo_from_arg(args.repo)
+    mapping = load_mapping(args.mapping)
+    if mapping:
+        print(f"-> loaded mapping from {args.mapping} "
+              f"(sections: {', '.join(mapping)})")
+
+    # Discover GitHub issue field IDs for all configured issue_fields.
+    field_ids = {}
+    if "issue_fields" in mapping:
+        org = args.repo.split("/")[0]
+        for gh_name in mapping["issue_fields"]:
+            fid = discover_issue_field(org, gh_name)
+            if fid:
+                field_ids[gh_name] = fid
+                print(f"-> discovered issue field '{gh_name}' (id={fid})")
+            else:
+                print(f"   ! issue field '{gh_name}' not found; "
+                      "values will be skipped.", file=sys.stderr)
 
     print(f"-> querying Notion database {args.database}")
     rows = paginate(f"{API}/databases/{args.database}/query", args.token, "POST", {})
@@ -266,13 +543,21 @@ def main():
     for i, row in enumerate(rows):
         props = row.get("properties", {})
         title = next((prop_value(p) for p in props.values() if p.get("type") == "title"), "") or "(untitled)"
-        img_dir = os.path.join(staging, f"{i:03d}")
-        os.makedirs(img_dir, exist_ok=True)
-        images = []
-        body = "\n".join(render(row["id"], args.token, img_dir, images)).strip()
-        if not images:
-            os.rmdir(img_dir)
-        labels, close = [], False
+
+        # In update mode, skip the expensive render + image download.
+        if args.update_existing:
+            body, images = "", []
+        else:
+            img_dir = os.path.join(staging, f"{i:03d}")
+            os.makedirs(img_dir, exist_ok=True)
+            images = []
+            body = "\n".join(render(row["id"], args.token, img_dir, images)).strip()
+            if not images:
+                os.rmdir(img_dir)
+
+        labels, assignees, close, close_reason = [], [], False, "completed"
+
+        # Legacy CLI flags.
         for name in args.label_prop:
             val = prop_value(props.get(name, {}))
             for v in (val if isinstance(val, list) else [val]):
@@ -281,9 +566,26 @@ def main():
         if args.status_prop and args.close_status:
             if str(prop_value(props.get(args.status_prop, {}))) == args.close_status:
                 close = True
+
+        # mapping.json overrides (additive for labels/assignees; status wins).
+        field_values = {}
+        if mapping:
+            m_labels, m_assign, m_close, m_reason, m_fv = apply_mapping(mapping, props)
+            labels.extend(m_labels)
+            assignees.extend(m_assign)
+            if m_close:
+                close, close_reason = True, m_reason
+            field_values = m_fv
+
         tasks.append({"i": i, "title": title[:250], "body": body,
-                      "img_dir": f"{i:03d}", "n_img": len(images), "labels": labels, "close": close})
-        print(f"   [{i:03d}] {title[:60]:60}  imgs={len(images)} labels={labels}")
+                      "img_dir": f"{i:03d}", "n_img": len(images),
+                      "labels": labels, "assignees": assignees,
+                      "close": close, "close_reason": close_reason,
+                      "field_values": field_values})
+        fv_str = " ".join(f"{k}={v}" for k, v in field_values.items())
+        print(f"   [{i:03d}] {title[:60]:60}  imgs={len(images)} "
+              f"labels={labels} assignees={assignees}"
+              + (f" {fv_str}" if fv_str else ""))
 
     # host images
     img_base = None
@@ -291,9 +593,66 @@ def main():
     if has_imgs and not args.no_images and not args.dry_run:
         img_base = host_images(args.repo, args.image_branch, staging, args.assets_dir)
 
+    # ------------------------------------------------------------------- #
+    # --update-existing: match by title and set field values only.
+    # ------------------------------------------------------------------- #
+    if args.update_existing:
+        if not field_ids:
+            raise SystemExit("--update-existing requires at least one "
+                             "issue_fields entry in the mapping.")
+        print(f"-> listing existing issues in {args.repo}")
+        r = gh(["issue", "list", "-R", args.repo, "--state", "all",
+                "--limit", "5000", "--json", "number,title"], check=True)
+        existing = json.loads(r.stdout)
+        by_title = {}
+        dup_titles = set()
+        for iss in existing:
+            title = iss["title"]
+            if title in by_title:
+                dup_titles.add(title)
+            else:
+                by_title[title] = iss["number"]
+        if dup_titles:
+            print(f"  ! {len(dup_titles)} duplicate issue titles detected; "
+                  "skipping updates for those titles.", file=sys.stderr)
+            for title in dup_titles:
+                by_title.pop(title, None)
+        print(f"   {len(existing)} existing issues loaded")
+        matched, skipped, updated = 0, 0, 0
+        for t in tasks:
+            num = by_title.get(t["title"])
+            if num is None:
+                skipped += 1
+                print(f"   [{t['i']:03d}] no match: {t['title'][:60]}")
+                continue
+            matched += 1
+            if not t["field_values"]:
+                continue
+            if args.dry_run:
+                fv = " ".join(f"{k}={v}" for k, v in t["field_values"].items())
+                print(f"   [{t['i']:03d}] #{num} would set {fv}")
+                updated += len(t["field_values"])
+                continue
+            for gh_name, val in t["field_values"].items():
+                fid = field_ids.get(gh_name)
+                if fid and set_issue_field_value(args.repo, num,
+                                                 fid, val, gh_name):
+                    print(f"   [{t['i']:03d}] #{num} set {gh_name}={val}")
+                    updated += 1
+            time.sleep(0.5)
+        verb = "would update" if args.dry_run else "updated"
+        print(f"\nDone: {matched} matched, {skipped} skipped, "
+              f"{verb} {updated} field values.")
+        shutil.rmtree(staging, ignore_errors=True)
+        return
+
     if args.dry_run:
+        n_close = sum(t["close"] for t in tasks)
+        n_assign = sum(bool(t["assignees"]) for t in tasks)
+        n_fields = sum(bool(t["field_values"]) for t in tasks)
         print(f"\nDRY RUN: would create {len(tasks)} issues "
-              f"({sum(t['close'] for t in tasks)} closed).")
+              f"({n_close} closed, {n_assign} with assignees, "
+              f"{n_fields} with issue fields).")
         shutil.rmtree(staging, ignore_errors=True)
         return
 
@@ -314,17 +673,23 @@ def main():
         bf = os.path.join(bodydir, f"{t['i']:03d}.md")
         with open(bf, "w") as f:
             f.write((body + footer).strip() or "(no content)")
-        url = create_issue(args.repo, t["title"], bf, t["labels"])
+        url = create_issue(args.repo, t["title"], bf, t["labels"], t["assignees"])
         if url:
             created += 1
+            issue_num = url.rstrip("/").split("/")[-1]
             if t["close"]:
-                to_close.append(url.rstrip("/").split("/")[-1])
+                to_close.append((issue_num, t["close_reason"]))
+            for gh_name, val in t["field_values"].items():
+                fid = field_ids.get(gh_name)
+                if fid and set_issue_field_value(args.repo, issue_num,
+                                                 fid, val, gh_name):
+                    print(f"   set {gh_name}={val} on #{issue_num}")
             print(f"   created {url}")
         time.sleep(1.5)  # be nice to the secondary rate limit
 
     # close done issues
-    for num in to_close:
-        gh(["issue", "close", num, "-R", args.repo, "-r", "completed"], check=False)
+    for num, reason in to_close:
+        gh(["issue", "close", num, "-R", args.repo, "-r", reason], check=False)
         time.sleep(1)
 
     shutil.rmtree(staging, ignore_errors=True)
